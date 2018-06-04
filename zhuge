@@ -1,0 +1,476 @@
+#!/usr/bin/env python
+# coding=utf-8
+
+import crawl_data.setup_crawl_env
+import django
+import json
+import logging
+import os
+import re
+import requests
+import sys
+import time
+import pdb
+
+os.environ['DJANGO_SETTINGS_MODULE'] = 'crawl_data.djangosite.settings'
+
+from crawl_data.djangosite.vertical_crawler.models import VerticalCrawlerResult
+from crawl_data.domain.article.utils import get_url_id
+from django.db import close_old_connections
+
+ZHUGE_ZHAOFANG_SEED_ID = 504
+
+
+class Zhuge(object):
+    proxies = {
+        'http': '10.3.14.62:8080',
+        'https': '10.3.14.61:3128',
+    }
+
+    def __init__(self):
+        self.citys = ['bj', 'wh', 'zz', 'xz']
+        # for city in self.citys:
+        #     if city == 'bj':
+        #         self.run_bj()
+        # elif city =='wh':
+        #      self.run_wh()
+        # elif city == 'zz':
+        #     self.run_zz()
+        # else:
+        #     self.run_xz()
+
+    # 获取二手房列表信息
+    def get_ershou_house_list(self, city):
+        url = 'http://api.zhugefang.com/API/House/search/addon/V3_1_3'
+        hs_type = 1
+        data = {
+            'city': city,
+            'token': 'TbR42eNa6jmmv_yZOWUw2UbkCEnEb5hAJpNA1qEFa3Mqnrl_ly1Cp7E2H_8YlYqve8RBbmB15bpsYJ2L4Y5O_bNPziDenq5kDf9A2mBNilqwOvBJWD6LjIpRSE_4tXC2',
+            'pageStart': 5000,
+            'pageLimit': '10',
+            'houseType': hs_type,
+        }
+
+        for page_start in range(1, 8000, 10):
+            print('page_start:%s' % page_start)
+            data['pageStart'] = page_start
+            r = requests.post(url=url, data=data, proxies=self.proxies)
+            body = json.loads(r.text)
+            house_data = body.get('data')
+            house_list = house_data.get('list')
+
+            # print(house_list)
+
+            for item in house_list:
+                house_id = item.get('id')
+                print('房源id: %s' % house_id)
+                self.get_house_info(house_id, hs_type, city, [])
+
+    # 获取房源具体信息页面
+    def get_house_info(self, house_id, house_type, city, finish_house_list=[]):
+        url = 'http://api.zhugefang.com/API/House/houseinfo/addon/V3_1_3'
+        params = {
+            'token': 'TbR42eNa6jmmv_yZOWUw2UbkCEnEb5hAJpNA1qEFa3Mqnrl_ly1Cp7E2H_8YlYqve8RBbmB15bpsYJ2L4Y5O_bNPziDenq5kDf9A2mBNilqwOvBJWD6LjIpRSE_4tXC2',
+            'house_id': house_id,
+            'city': city,
+            'house_type': house_type
+        }
+        r = requests.get(url=url, params=params, proxies=self.proxies)
+        # print(json.loads(r.text.get(house_id)))
+        body = json.loads(r.text)
+
+        data = body.get('data')  # 房源信息数据
+        borough_id = data.get('borough_id')  # 房源所在小区id
+        print('小区id: %s' % borough_id)
+        high_low_price = self.get_house_lowest_and_highest_price(house_id, house_type, borough_id, city)  # 房源最低价+最高价
+        weihuren = self.get_weihuren(house_id, house_type, city)  # 房源信息维护人
+        shiguangji = self.get_house_shiguangji(house_id, house_type, city)  # 房源时光机
+
+        house_jingjiren_list = self.get_house_jingjiren(house_id, city)  # 房源经纪人列表
+        borough_jingjiren_list = self.get_borough_jingjiren(borough_id, city)  # 小区经纪人列表
+
+        borough_info = self.get_borough_info(borough_id, house_type, city, finish_house_list)  # 房源小区信息(包括成交记录)
+
+        result = {}
+        result['house_highest_and_lowest_price'] = high_low_price
+        result['house_weihuren_info'] = weihuren
+
+        result['borough_info'] = borough_info.get('borough_data')
+        result['borough_finish_list'] = borough_info.get('borough_finish_list')
+
+        result['borough_croker_claim_list'] = borough_jingjiren_list
+        result['house_memory_machine'] = shiguangji
+        result['house_croker_claim_list'] = house_jingjiren_list
+        result['house_data'] = data
+        self.mysql_save(r.url, json.dumps(result), city)
+
+        # 获取房源所在小区相关信息(包括房源成交记录)
+
+    def get_borough_info(self, id, house_type, city, finish_list=[]):
+        url = 'http://api.zhugefang.com/API/Borough/getBoroughData/addon/V3_1_3'
+        params = {
+            'token': 'TbR42eNa6jmmv_yZOWUw2UbkCEnEb5hAJpNA1qEFa3Mqnrl_ly1Cp7E2H_8YlYqve8RBbmB15bpsYJ2L4Y5O_bNPziDenq5kDf9A2mBNilqwOvBJWD6LjIpRSE_4tXC2',
+            'city': city,
+            'id': id,
+        }
+        print('进入borough_info 方法')
+        r = requests.get(url=url, params=params, proxies=self.proxies)
+        try:
+            body = json.loads(r.text)
+            data = body.get('data')
+            borough_finish_num = data.get('house_num').get('finish')
+            print(borough_finish_num)
+            finish_data = self.get_finish_house_info(city, int(borough_finish_num), id, house_type, finish_list)
+            return {'borough_data': data,
+                    'borough_finish_list': finish_data}
+        except Exception as e:
+            print('borough_id: %s' % id)
+            # print('r.text:%s' % r.text)
+            return {'borough_data': {},
+                    'borough_finish_list': {}}
+
+    # 获取小区成交记录
+    def get_finish_house_info(self, city, total_finish_num, borough_id, house_type, finish_list=[]):
+        print('进入finish_list 方法')
+        # pdb.set_trace()
+        if total_finish_num == 0:
+            return []
+        else:
+            page_num = total_finish_num / 10
+            index = 0
+            while index <= page_num:
+                url = 'http://api.zhugefang.com/API/Borough/boroughfinish/addon/V3_1_3'
+                dat = {
+                    'house_type': house_type,
+                    'borough_id': borough_id,
+                    'page': index,
+                    'city': city
+                }
+                r = requests.post(url=url, data=dat, proxies=self.proxies)
+
+                try:
+                     body = json.loads(r.text)
+                     finish_list.append(body.get('data'))
+                     index += 1
+                except Exception as e:
+                     print('r.text:%s' % r.text)
+                     print('finish_list出现异常')
+
+            return finish_list
+
+    # 获取房源维护人
+    def get_weihuren(self, house_id, house_type, city):
+        url = 'http://api.zhugefang.com/API/House/getbrokertel/addon/V3_1_3'
+        params = {
+            'token': 'TbR42eNa6jmmv_yZOWUw2UbkCEnEb5hAJpNA1qEFa3Mqnrl_ly1Cp7E2H_8YlYqve8RBbmB15bpsYJ2L4Y5O_bNPziDenq5kDf9A2mBNilqwOvBJWD6LjIpRSE_4tXC2',
+            'house_id': house_id,
+            'house_type': house_type,
+            'city': city
+        }
+        r = requests.get(url=url, params=params, proxies=self.proxies)
+        print('进入weihuren 方法')
+        try:
+            body = json.loads(r.text)
+            data = body.get('data')
+            return data
+        except Exception as e:
+            print('r.text:%s' % r.text)
+            return {}
+
+
+    # 获取房源所在小区成交最高价，最低价
+    def get_house_lowest_and_highest_price(self, house_id, house_type, borough_id, city):
+        url = 'http://api.zhugefang.com/API/House/getcompare/addon/V3_1_3'
+        params = {
+            'token': 'TbR42eNa6jmmv_yZOWUw2UbkCEnEb5hAJpNA1qEFa3Mqnrl_ly1Cp7E2H_8YlYqve8RBbmB15bpsYJ2L4Y5O_bNPziDenq5kDf9A2mBNilqwOvBJWD6LjIpRSE_4tXC2',
+            'house_id': house_id,
+            'city': city,
+            'house_type': house_type,
+            'borough_id': borough_id,
+        }
+        r = requests.get(url=url, params=params, proxies=self.proxies)
+        print('进入high_and_low 方法')
+        try:
+            body = json.loads(r.text)
+            data = body.get('data')
+            highest_price = data.get('high_price')
+            lowest_price = data.get('low_price')
+            return {
+                'high': highest_price,
+                'low': lowest_price,
+            }
+        except Exception as e:
+            print('r.text:%s' % r.text)
+            return {
+                'high': {},
+                'low': {},
+            }
+
+
+    # 获取房源时光机信息
+    def get_house_shiguangji(self, house_id, house_type, city):
+        url = 'http://api.zhugefang.com/API/House/houseinfotimemachine/addon/V3_1_3'
+        data = {
+            # 'token': 'TbR42eNa6jmmv_yZOWUw2UbkCEnEb5hAJpNA1qEFa3Mqnrl_ly1Cp7E2H_8YlYqve8RBbmB15bpsYJ2L4Y5O_bNPziDenq5kDf9A2mBNilqwOvBJWD6LjIpRSE_4tXC2',
+            'city': city,
+            'house_id': house_id,
+            'house_type': house_type,
+        }
+
+        r = requests.post(url=url, data=data, proxies=self.proxies)
+        print('进入memo_machine 方法')
+        try:
+
+            body = json.loads(r.text)
+            machine_data = body.get('data')
+            return machine_data
+        except Exception as e:
+            print('r.text:%s' % r.text)
+            return {}
+
+
+    # 获取房源经纪人
+    def get_house_jingjiren(self, house_id, city):
+        url = 'http://api.zhugefang.com/API/House/housebrokerclaim/addon/V3_1_3'
+        data = {
+            # 'token': 'TbR42eNa6jmmv_yZOWUw2UbkCEnEb5hAJpNA1qEFa3Mqnrl_ly1Cp7E2H_8YlYqve8RBbmB15bpsYJ2L4Y5O_bNPziDenq5kDf9A2mBNilqwOvBJWD6LjIpRSE_4tXC2',
+            'house_id': house_id,
+            'city': city
+        }
+        r = requests.post(url=url, data=data, proxies=self.proxies)
+        print('进入house_jingjiren_方法')
+        try:
+            body = json.loads(r.text)
+            house_jingjiren = body.get('data')
+        except Exception as e:
+            print('r.text:%s' % r.text)
+        return house_jingjiren
+
+
+    # 获取小区经纪人
+    def get_borough_jingjiren(self, borough_id, city):
+        url = 'http://api.zhugefang.com/API/House/selectmanysource/addon/V3_1_3'
+        data = {
+            'borough_id': borough_id,
+            'city': city
+        }
+        r = requests.post(url=url, data=data, proxies=self.proxies)
+        print('进入borough_jingjiren_方法')
+        body = json.loads(r.text)
+        borough_jingjiren = body.get('data')
+        return borough_jingjiren
+
+
+    # def run_bj(self):
+    #     # self.get_bj_new_house_list()
+    #     self.get_bj_old_house_list()
+
+    # self.get_bj_leasing_house_list()
+    # self.get_bj_search_neighbor()
+
+    # # 北京二手房列表
+    # def get_bj_old_house_list(self):
+    #     url = 'http://api.zhugefang.com/API/House/search/addon/V3_1_3'
+    #     data = {
+    #         'city': 'bj',
+    #         'token': 'TbR42eNa6jmmv_yZOWUw2UbkCEnEb5hAJpNA1qEFa3Mqnrl_ly1Cp7E2H_8YlYqve8RBbmB15bpsYJ2L4Y5O_bNPziDenq5kDf9A2mBNilqwOvBJWD6LjIpRSE_4tXC2',
+    #         'pageStart': '1',
+    #         'pageLimit': '10',
+    #         'houseType': '1',
+    #     }
+    #     # 抓取5w条数据
+    #     for x in range(5000):
+    #         r = requests.post(url = url, data = data, proxies = self.proxies)
+    #         content = r.text
+    #
+    #         body = json.loads(content)
+    #         data = body.get('data')
+    #         house_list = data.get('list')
+    #         # print(content)
+    #
+    #         self.get_house_content(house_list, 1)
+    #         dat['pageStart'] = str(int(dat['pageStart']) + 10)
+    #
+    # # 抓取房源具体信息页的数据
+    # def get_house_content(self, house_list, house_type):
+    #     for item in house_list:
+    #         print('house_id:%s' % item.get('id'))
+    #         print('borough_id:%s' % item.get('borough_id'))
+    #
+    #         url = 'http://api.zhugefang.com/API/House/houseinfo/addon/V3_1_3'
+    #         con = {
+    #             'city': 'bj',
+    #             'token': 'TbR42eNa6jmmv_yZOWUw2UbkCEnEb5hAJpNA1qEFa3Mqnrl_ly1Cp7E2H_8YlYqve8RBbmB15bpsYJ2L4Y5O_bNPziDenq5kDf9A2mBNilqwOvBJWD6LjIpRSE_4tXC2',
+    #             'house_id': item.get('id'),
+    #         }
+    #
+    #         r = requests.post(url = url, data = con, proxies = self.proxies)
+    #         print(r.text)
+    #         # body = json.loads(r.text)
+    #         # show = body.get('data')
+    #         # print(show)
+    #         # json_data = json.dumps(r.text)
+    #         self.mysql_save(url, r.text, house_type)
+
+    # 北京租房列表
+    def get_leasing_house_list(self):
+        url = 'http://api.zhugefang.com/API/House/search/addon/V3_1_3'
+        hs_type = 2
+        data = {
+            'city': 'bj',
+            'token': 'TbR42eNa6jmmv_yZOWUw2UbkCEnEb5hAJpNA1qEFa3Mqnrl_ly1Cp7E2H_8YlYqve8RBbmB15bpsYJ2L4Y5O_bNPziDenq5kDf9A2mBNilqwOvBJWD6LjIpRSE_4tXC2',
+            'pageStart': '1',
+            'pageLimit': '10',
+            'houseType': hs_type,
+            'appName': 'zgzf',
+        }
+
+        for page_start in range(1, 10000, 10):
+            print('page_start:%s' % page_start)
+            data['pageStart'] = page_start
+            r = requests.post(url=url, data=data, proxies=self.proxies)
+            body = json.loads(r.text)
+            house_data = body.get('data')
+            house_list = house_data.get('list')
+            for item in house_list:
+                house_id = item.get('id')
+                self.get_house_info(house_id, hs_type)
+
+
+    # 新房列表
+    def get_new_house_list(self):
+        url = 'http://api.zhugefang.com/API/NewHouseBorough/getBorough/addon/V3_1_3'
+
+        dat = {
+            'city': 'bj',
+            'token': 'TbR42eNa6jmmv_yZOWUw2UbkCEnEb5hAJpNA1qEFa3Mqnrl_ly1Cp7E2H_8YlYqve8RBbmB15bpsYJ2L4Y5O_bNPziDenq5kDf9A2mBNilqwOvBJWD6LjIpRSE_4tXC2',
+            'pageStart': '1',
+            'pageLimit': '10',
+            'appName': 'zgzf',
+            # 'md5_str': '0994db2bad1c1e19bee82f37252ef6e7'
+
+        }
+        # 抓取2k条数据
+        for x in range(200):
+            r = requests.post(url=url, data=dat, proxies=self.proxies)
+            content = r.text
+            body = json.loads(content)
+            data = body.get('data')
+
+            house_list = data.get('list')
+            # pdb.set_trace()
+            # print(content)
+
+            self.get_new_house_content(house_list, 3)
+            dat['pageStart'] = str(int(dat['pageStart']) + 10)
+
+
+    # 抓取新房具体信息
+    def get_new_house_content(self, house_list, house_type):
+        for item in house_list:
+            complex_id = item.get('complex_id')
+            # pdb.set_trace()
+            # pdb.set_trace()
+
+            url = 'http://api.zhugefang.com/API/NewHouseBorough/getComplexInfo/addon/V3_1_3'
+            con = {
+                'city': 'bj',
+                'token': 'TbR42eNa6jmmv_yZOWUw2UbkCEnEb5hAJpNA1qEFa3Mqnrl_ly1Cp7E2H_8YlYqve8RBbmB15bpsYJ2L4Y5O_bNPziDenq5kDf9A2mBNilqwOvBJWD6LjIpRSE_4tXC2',
+                'appName': 'zgzf',
+                'complex_id': complex_id,
+            }
+
+            r = requests.post(url=url, data=con, proxies=self.proxies)
+            print(r.text)
+            # body = json.loads(r.text)
+            # json_data = json.dumps(r.text)
+            self.mysql_save(url, r.text, house_type)
+
+
+    # 北京找小区
+    def get_search_borough(self):
+        url = 'http://api.zhugefang.com/API/Borough/getBoroughDataList/addon/V3_1_3'
+        dat = {
+            'city': 'bj',
+            'token': 'TbR42eNa6jmmv_yZOWUw2UbkCEnEb5hAJpNA1qEFa3Mqnrl_ly1Cp7E2H_8YlYqve8RBbmB15bpsYJ2L4Y5O_bNPziDenq5kDf9A2mBNilqwOvBJWD6LjIpRSE_4tXC2',
+            'find_borough': 'find_borough',
+            'pageStart': '1',
+            'pageLimit': '10',
+        }
+        # 抓取2w条数据
+        for x in range(2000):
+            r = requests.post(url=url, data=dat, proxies=self.proxies)
+            content = r.text
+            # pdb.set_trace()
+            body = json.loads(content)
+            house_list = body.get('data')
+            # print(content)
+            # pdb.set_trace()
+            self.get_xiaoqu_content(house_list, 4)
+            dat['pageStart'] = str(int(dat['pageStart']) + 10)
+
+
+    def get_xiaoqu_content(self, house_list, house_type):
+        for item in house_list:
+            # 具体小区id
+            # pdb.set_trace()
+            borough_id = item.get('borough_id')
+
+            # pdb.set_trace()
+
+            url = 'http://api.zhugefang.com/API/Borough/getBoroughData/addon/V3_1_3'
+            con = {
+                'city': 'bj',
+                'token': 'TbR42eNa6jmmv_yZOWUw2UbkCEnEb5hAJpNA1qEFa3Mqnrl_ly1Cp7E2H_8YlYqve8RBbmB15bpsYJ2L4Y5O_bNPziDenq5kDf9A2mBNilqwOvBJWD6LjIpRSE_4tXC2',
+                'id': borough_id,
+            }
+
+            r = requests.post(url=url, data=con, proxies=self.proxies)
+            print(r.text)
+            # body = json.loads(r.text)
+            # json_data = json.dumps(r.text)
+            self.mysql_save(url, r.text, house_type)
+
+
+    def mysql_save(self, base_url, sql_json_data, city):
+        close_old_connections()
+
+        extra_res = self.extra_ershoufang_content(city)
+        print(extra_res)
+        modify_time = time.strftime('%Y-%m-%d %H:%M:%S', time.localtime())
+        new_url = base_url + modify_time
+        VerticalCrawlerResult.objects.update_or_create(
+            url_id=get_url_id(new_url),
+            url=new_url,
+            extra=extra_res,
+            crawler_name='zhuge_zhaofang',
+            defaults=dict(seed_id=ZHUGE_ZHAOFANG_SEED_ID,
+                          extract_json=sql_json_data)
+        )
+        # logging.info('MySQL Created : url_id - %s' % (get_url_id(new_url)))
+
+
+    # 数据库extra字段
+    def extra_ershoufang_content(self, city):
+        if city == 'bj':
+            data = '{"%s": "zg_ershoufang"}' % city
+        elif city == 'wh':
+            data = '{"%s": "zg_ershoufang"}' % city
+        elif city == 'zz':
+            data = '{"%s": "zg_ershoufang"}' % city
+        else:
+            data = '{"%s": "zg_ershoufang"}' % city
+        return data
+
+
+if __name__ == '__main__':
+    reload(sys)
+    sys.setdefaultencoding('utf8')
+    django.setup()
+    zg = Zhuge()
+    citys = ['xz']
+    for item in citys:
+        zg.get_ershou_house_list(item)
+    # zg.get_bj_new_house_list()
+    # zg.get_leasing_house_list()
+
