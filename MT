@@ -1,0 +1,9 @@
+thread_list = []
+        threads_bj = [threading.Thread(target=self.get_ershou_house_list, args=(self.bj, ERSHOU_house_type)) for _ in
+                      range(3)]
+        thread_list.extend(threads_bj)
+        for items in self.cities:
+            thread_list.append(threading.Thread(target=self.get_ershou_house_list, args=(items, ERSHOU_house_type)))
+
+        [u.start() for u in thread_list]
+        [u.join() for u in thread_list]
